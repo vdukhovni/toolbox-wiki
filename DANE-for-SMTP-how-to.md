@@ -1,9 +1,10 @@
 # Table of contents
-- [Executive Summary](#summary)
+- [Executive Summary](#executive-summary)
 - [Introduction](#introduction)
-- [What is DANE?](#what-is-dane-)
-- [Why use DANE for SMTP?](#why-use-dane-for-smtp-)
-- [Guaranteeing a valid TLSA record](#guaranteeing-a-valid-tlsa-record)
+- [What is DANE?](#what-is-dane)
+- [Why use DANE for SMTP?](#why-use-dane-for-smtp)
+- [DANE TLSA records for SMTP](#dane-tlsa-records-for-smtp)
+- [Reliable certificate rollover](#reliable-certificate-rollover)
 - [Tips, tricks and notices for implementation](#tips--tricks-and-notices-for-implementation)
 - [Outbound e-mail traffic (DNS records)](#outbound-e-mail-traffic--dns-records-)
   * [Generating DANE records](#generating-dane-records)
@@ -53,6 +54,73 @@ DANE addresses these shortcomings because:
 * This allows sending mail servers to unconditionally require STARTTLS with a matching certificate chain. Otherwise, the sending mail server aborts the connection and tries another server or defers the message.
 * Receiving servers with published TLSA records, are therefore no longer vulnerable to "STARTTLS stripping".
 
+# DANE TLSA records for SMTP
+As specified in [Section 2 of RFC6698](https://tools.ietf.org/html/rfc6698#section-2), a DANE TLSA record is used to associate a TLS server certificate or public key with a network service endpoint, thus forming a "TLSA certificate association".  For MTA-to-MTA SMTP the TLSA record is published in DNS at a domain which is formed by prepending `_25._tcp.` to the hostname of each SMTP server (or sometimes its full __secure__ CNAME expansion). For example (all records assumed DNSSEC signed, associated RRSIG not shown):
+```
+example.com. IN MX 0 mx1.example.com.
+example.com. IN MX 0 mx2.example.com.
+;
+mx1.example.com. IN A 192.0.2.1
+_25._tcp.mx1.example.com. IN TLSA 3 1 1 ab837de5bfde4288617983905e8e15398d0b4d32152399c816bba122b7bb0990
+_25._tcp.mx1.example.com. IN TLSA 3 1 1 844feb66064906f0f2079f2adc8ce0457829ebc9d7a57527bc1bbf686683f8b2
+;
+mx2.example.com. IN A 192.0.2.1
+_25._tcp.mx2.example.com. IN TLSA 3 1 1 abe4387121ba18ea82e7f148366e0e3bd55d72ab6bc9abb6c96b8bedfede3c48
+_25._tcp.mx2.example.com. IN TLSA 3 1 1 dfc2908e0a2331eeeb11f2028cb2b265cdde6045d9264095854fb006b5de0a8f
+```
+The four fields of a TLSA record are:
+* **Certificate Usage** ([Section 2.1.1 of RFC6698](https://tools.ietf.org/html/rfc6698#section-2.1.1)), with values as follows:
+    - **3** or **DANE-EE** ([Section 2.1 of RFC7218](https://tools.ietf.org/html/rfc7218#section-2.1)), or DANE-EE(3).  This is an end-entity "certificate association", i.e. it specifies the actual service certificate or public key, rather than a trusted issuer. When in doubt, use this certificate usage.
+    - **2**, or **DANE-TA** ([Section 2.1 of RFC7218](https://tools.ietf.org/html/rfc7218#section-2.1)),
+      or DANE-TA(2). This is a trust-anchor "certificate association", i.e. it designates a CA as
+      trusted to issue certificates for the (in this case SMTP) service.
+    - Certificate usages PKIX-EE(1) and PKIX-TA(0) are not applicable to MTA-to-MTA SMTP. See [Section 3.1.2 of RFC7672](https://tools.ietf.org/html/rfc7672#section-3.1.3)
+* **Selector** ([Section 2.1.2 of RFC6698](https://tools.ietf.org/html/rfc6698#section-2.1.2)), with values as follows:
+    - **1**, or **SPKI** ([Section 2.2 of RFC7218](https://tools.ietf.org/html/rfc7218#section-2.2)), or SPKI(1). This indicates that the __certificate association data__ field (see below) matches just the subject public key of the certificate (end-entity or trust-anchor per the __usage__). When in doubt, use this selector.
+    - **0**, or **Cert** ([Section 2.2 of RFC7218](https://tools.ietf.org/html/rfc7218#section-2.2)), or Cert(0). This indicates that the __certificate association data__ field (see below) matches the complete certificate.
+* **Matching type** ([Section 2.1.3 of RFC6698](https://tools.ietf.org/html/rfc6698#section-2.1.3)), with values as follows:
+    - **1**, or **SHA2-256** ([Section 2.3 of RFC7218](https://tools.ietf.org/html/rfc7218#section-2.3)), or SHA2-256(1). This indicates that the __certificate association data__ field (see below) is the SHA2-256 digest of the DER encoding of the public key (selector SPKI(1)) or the certificate (selector Cert(0)). When in doubt, use this matching type.
+    - **2**, or **SHA2-512** ([Section 2.3 of RFC7218](https://tools.ietf.org/html/rfc7218#section-2.3)), or SHA2-512(2). This indicates that the __certificate association data__ field (see below) is the SHA2-512 digest of the DER encoding of the public key (selector SPKI(1)) or the certificate (selector Cert(0)). The practical security advantages of SHA2-512 over SHA2-256 are slim, and increased DNS packet sizes make this choice less preferred.
+    - **0**, or **Full** ([Section 2.3 of RFC7218](https://tools.ietf.org/html/rfc7218#section-2.3)), or Full(0). This indicates that the __certificate association data__ field (see below) contains the complete DER encoding of the public key (selector SPKI(1)) or the certificate (selector Cert(0)). This leads to even larger packet sizes, especially with RSA keys or full certificates. This matching type should be avoided.
+* **Certificate association data** ([Section 2.1.4 of RFC6698](https://tools.ietf.org/html/rfc6698#section-2.1.4)):
+   - This field holds the either the digest value or full DER value of the public key (SPKI(1)) or certificate (Cert(0)). It is written in hexadecimal (presentation form) in zone files and user interfaces, and carried as raw binary data (wire form) in DNS packets.
+
+Consequently, for MTA-to-MTA SMTP, you can keep it simple and only use or both of two TLSA RR types, none of the others offer any advantages:
+
+* **3 1 1**, or **DANE-EE(3) SPKI(1) SHA2-256(1)**. These encode the SHA2-256 digest of an SMTP-server's public key.
+* **2 1 1**, or **DANE-TA(2) SPKI(1) SHA2-256(1)**. These encode the SHA2-256 digest of a trusted issuer CA's public key.
+
+The [certificate rollover](#reliable-certificate-rollover) strategies below use only these record types.
+
+When multiple TLSA records are published for the same service,
+authentication succeeds when **any** one of them is a match.  As
+we'll see below, having a mixture of matching and non-matching keys
+facilitates non-disruptive certificate changes.
+
+Use of DANE-TA(2) trust-anchors does not imply the use of one of
+the WebPKI public CAs. A domain can use its own private CA to issue
+server certificates, provided that there's no requirement to also
+support WebPKI-based server authentication (e.g. MTA-STS).  While
+some sites do use DANE-TA(2) trust-anchors associated with public
+CAs such as "Let's Encrypt", this convenience comes at a cost to
+security, since __domain-validated__ certificate issuance uses
+comparatively weak __proofs__ of domain control. "3 1 1" records
+offer stronger security.
+
+Some servers are configured with multiple certificate chains even
+for the same hostname (not to be confused with SNI-based
+single-certificate **per-hostname**). Such a server might, for
+example, have one certificate chain with an RSA key (for interoperability
+with legacy systems), and one or more additional certificate chains
+with perhaps an ECDSA or an Ed25519 key. Such servers may present
+different certificates to different clients based on the client's
+advertised supported algorithms. This means that the server's TLSA
+records need to match all the possible certificates any client may
+encounter. Such a server would need DANE-EE(3) TLSA records, one
+per algorithm, and then additional per-algorithm TLSA records during
+certificate updates. This is an advanced configuration, and most
+operators should deploy just one certificate chain at a time.
+
 # Reliable certificate rollover
 It is a good practice to replace certificates and keys from time to time, but this need not and should not disrupt email delivery even briefly.
 * Since a single TLSA record is tied to a particular certificate or (public) key, the TLSA records that match a server's certificate chain also change from time to time.
@@ -74,7 +142,7 @@ Two ways of handling certificate rollover are known to work well, in combination
     - And a second with the SHA2-256 fingerprint of the public key of an issuing CA that directly or indirectly signed the server certificate (2 1 1). This need not be (and typically is not) a root CA.
 
 ## Current + next details
-With the "current + next" approach, because both fingerprint are **key** fingerprints, the second can be known in advance of obtaining the corresponding certificate. In particular, if keys are rotated often enough (every 30 to 90 days or so), the next key can be pre-generated as soon-as the previous key and certificate are deployed. This allows plenty of time to publish the corresponding **next** "3 1 1" TLSA record to replace the legacy record for the decommissioned key.
+With the "current + next" approach, because both fingerprint are **key** fingerprints, the "next" TLSA record can be generated and published in advance of obtaining the corresponding certificate. In particular, if keys are rotated often enough (every 30 to 90 days or so), the next key can be generated as soon-as the previous key and certificate are deployed. This allows plenty of time to publish the corresponding **next** "3 1 1" TLSA record to replace the legacy record for the decommissioned key.
 
 With TLSA record that will match the next key long in place, when it is time to deploy that key with a new certificate some 30 to 90 days later, a new certificate is obtained for *that* key and deployed, and the process begins again with another "next" key generated right away.
 
@@ -87,6 +155,9 @@ Use of the same key (and perhaps wildcard certificate) across all of a domain's 
 When monitoring your systems, test every IPv4 and IPv6 address of each MX host, not all clients will be able connect to every address, and none should encounter incorrect TLSA records, neglected certificates, or even non-working STARTTLS. Also test each public key algorithm, or stick to just one. All DANE-capable SMTP servers support both RSA and ECDSA P-256, so you can pick just RSA (2048-bit key) or ECDSA (P-256).
 
 Make sure that your servers support TLS 1.2, and offer STARTTLS to all clients, even those that have not sent you email in the past. Denying STARTTLS to clients with no IP "reputation" would lock them out indefinitely if they support DANE, since they then can never send any initial mail in the clear to establish their reputation.
+
+## Current + issuer details
+With the "current + issuer" approach, the published TLSA records specify the public keys of the leaf (end-entity), the second can be known in advance of obtaining the corresponding certificate. In particular, if keys are rotated often enough (every 30 to 90 days or so), the next key can be pre-generated as soon-as the previous key and certificate are deployed. This allows plenty of time to publish the corresponding **next** "3 1 1" TLSA record to replace the legacy record for the decommissioned key.
 
 # Tips, tricks and notices for implementation
 This section describes several pionts for attention when implementing DANE for SMTP. 
